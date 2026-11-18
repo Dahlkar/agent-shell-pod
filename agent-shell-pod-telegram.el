@@ -15,6 +15,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'url)
+(require 'url-util)
 (require 'auth-source)
 (require 'agent-shell-pod)
 
@@ -130,19 +131,69 @@
   (setq agent-shell-pod-telegram--messages
         (seq-take agent-shell-pod-telegram--messages agent-shell-pod-telegram--max-messages)))
 
-(defun agent-shell-pod-telegram--send-chunks (chunks buffer markup callback)
-  "Send CHUNKS in order, then call CALLBACK with the last message id."
-  (agent-shell-pod-telegram--api
-   "sendMessage"
-   `((chat_id . ,agent-shell-pod-telegram-user-id)
-     (text . ,(car chunks))
-     ,@(and markup (null (cdr chunks)) `((reply_markup . ,markup))))
-   (lambda (reply)
-     (let ((id (map-nested-elt reply '(result message_id))))
-       (when (and id buffer) (agent-shell-pod-telegram--remember id buffer))
-       (cond ((cdr chunks)
-              (agent-shell-pod-telegram--send-chunks (cdr chunks) buffer markup callback))
-             ((and id callback) (funcall callback id)))))))
+(defun agent-shell-pod-telegram--html-inline (text)
+  "Convert inline code, bold, links and headings in TEXT to Telegram HTML."
+  (let ((start 0) out)
+    (while (string-match "`\\([^`\n]+\\)`" text start)
+      (let ((before (substring text start (match-beginning 0)))
+            (code (match-string 1 text)))
+        (setq start (match-end 0))
+        (push (agent-shell-pod-telegram--html-markup before) out)
+        (push (concat "<code>" (url-insert-entities-in-string code) "</code>") out)))
+    (push (agent-shell-pod-telegram--html-markup (substring text start)) out)
+    (apply #'concat (nreverse out))))
+
+(defun agent-shell-pod-telegram--html-markup (text)
+  "Escape TEXT and convert bold, links and headings to Telegram HTML."
+  (let ((html (url-insert-entities-in-string text)))
+    (dolist (rule '(("\\*\\*\\([^*\n]+?\\)\\*\\*" . "<b>\\1</b>")
+                    ("\\[\\([^]\n]+\\)\\](\\([^) \n]+\\))" . "<a href=\"\\2\">\\1</a>")
+                    ("^#+ \\(.+\\)$" . "<b>\\1</b>")))
+      (setq html (replace-regexp-in-string (car rule) (cdr rule) html t)))
+    html))
+
+(defun agent-shell-pod-telegram--html (text)
+  "Convert the markdown subset in TEXT to Telegram HTML."
+  (let ((start 0) out)
+    (while (string-match "^```\\([^`\n]*\\)\n" text start)
+      (let* ((before (substring text start (match-beginning 0)))
+             (lang (string-trim (match-string 1 text)))
+             (body-start (match-end 0))
+             (close (string-match "^```[^\n]*\n?" text body-start))
+             (body (substring text body-start (or close (length text)))))
+        (setq start (if close (match-end 0) (length text)))
+        (push (agent-shell-pod-telegram--html-inline before) out)
+        (push (format "<pre><code%s>%s</code></pre>"
+                      (if (string-empty-p lang) ""
+                        (format " class=\"language-%s\"" (url-insert-entities-in-string lang)))
+                      (url-insert-entities-in-string (string-remove-suffix "\n" body)))
+              out)))
+    (push (agent-shell-pod-telegram--html-inline (substring text start)) out)
+    (apply #'concat (nreverse out))))
+
+(defun agent-shell-pod-telegram--send-chunks (chunks tag buffer markup callback)
+  "Send CHUNKS prefixed with TAG, then call CALLBACK with the last message id.
+Each chunk goes as HTML and is resent as plain text when Telegram rejects it."
+  (let ((params `((chat_id . ,agent-shell-pod-telegram-user-id)
+                  ,@(and markup (null (cdr chunks)) `((reply_markup . ,markup)))))
+        (continue
+         (lambda (reply)
+           (let ((id (map-nested-elt reply '(result message_id))))
+             (when (and id buffer) (agent-shell-pod-telegram--remember id buffer))
+             (cond ((cdr chunks)
+                    (agent-shell-pod-telegram--send-chunks (cdr chunks) tag buffer markup callback))
+                   ((and id callback) (funcall callback id)))))))
+    (agent-shell-pod-telegram--api
+     "sendMessage"
+     `((text . ,(concat (url-insert-entities-in-string tag)
+                        (agent-shell-pod-telegram--html (car chunks))))
+       (parse_mode . "HTML")
+       ,@params)
+     (lambda (reply)
+       (if (eq (alist-get 'ok reply) t)
+           (funcall continue reply)
+         (agent-shell-pod-telegram--api
+          "sendMessage" `((text . ,(concat tag (car chunks))) ,@params) continue))))))
 
 (defun agent-shell-pod-telegram--say (text &optional buffer markup callback)
   "Send TEXT, tagged with session BUFFER when given.
@@ -150,10 +201,9 @@ MARKUP goes on the last message and CALLBACK gets its id."
   (let ((tag (if buffer (concat (agent-shell-pod-telegram--tag buffer) "\n") "")))
     (when buffer (setq agent-shell-pod-telegram--current buffer))
     (agent-shell-pod-telegram--send-chunks
-     (mapcar (lambda (chunk) (concat tag chunk))
-             (agent-shell-pod-telegram--split
-              text (- agent-shell-pod-telegram--max-length (length tag))))
-     buffer markup callback)))
+     (agent-shell-pod-telegram--split
+      text (- agent-shell-pod-telegram--max-length (length tag)))
+     tag buffer markup callback)))
 
 (defun agent-shell-pod-telegram--current ()
   "Return the session that untargeted messages go to."
@@ -184,7 +234,15 @@ MARKUP goes on the last message and CALLBACK gets its id."
                               (agent-shell-pod-telegram--label b)
                               (if (eq b current) " ←" "")))
                     sessions "\n")
-       "No sessions"))))
+       "No sessions")
+     nil
+     (and sessions
+          `((inline_keyboard
+             . ,(vconcat (mapcar (lambda (b)
+                                   (let ((n (agent-shell-pod-telegram--number-of b)))
+                                     (vector `((text . ,(format "%d %s" n (agent-shell-pod-telegram--label b)))
+                                               (callback_data . ,(format "use:%d" n))))))
+                                 sessions))))))))
 
 (defun agent-shell-pod-telegram--use (arg)
   "Make session ARG current."
@@ -243,15 +301,20 @@ MARKUP goes on the last message and CALLBACK gets its id."
           (with-current-buffer buffer (agent-shell-prompt-queue .text)))))))
 
 (defun agent-shell-pod-telegram--on-callback (query)
-  "Answer the permission chosen with the button in QUERY."
+  "Answer the permission or session chosen with the button in QUERY."
   (let-alist query
     (let* ((data (or .data ""))
            (parts (and (string-match "\\`\\([^:]+\\):\\(.*\\)\\'" data)
                        (cons (match-string 1 data) (match-string 2 data))))
            (pending (and parts (gethash (car parts) agent-shell-pod-telegram--pending))))
-      (if (not (and pending (buffer-live-p (plist-get pending :buffer))))
-          (agent-shell-pod-telegram--api "answerCallbackQuery"
-                                         `((callback_query_id . ,.id) (text . "Expired")))
+      (cond
+       ((equal (car parts) "use")
+        (agent-shell-pod-telegram--api "answerCallbackQuery" `((callback_query_id . ,.id)))
+        (agent-shell-pod-telegram--use (cdr parts)))
+       ((not (and pending (buffer-live-p (plist-get pending :buffer))))
+        (agent-shell-pod-telegram--api "answerCallbackQuery"
+                                       `((callback_query_id . ,.id) (text . "Expired"))))
+       (t
         (remhash (car parts) agent-shell-pod-telegram--pending)
         (funcall (plist-get pending :respond) (cdr parts))
         (let ((label (or (cdr (assoc (cdr parts) (plist-get pending :options))) (cdr parts))))
@@ -261,7 +324,7 @@ MARKUP goes on the last message and CALLBACK gets its id."
                                          `((chat_id . ,agent-shell-pod-telegram-user-id)
                                            (message_id . ,.message.message_id)
                                            (text . ,(concat (plist-get pending :text)
-                                                            "\n\n→ " label)))))))))
+                                                            "\n\n→ " label))))))))))
 
 (defun agent-shell-pod-telegram--dispatch (update)
   "Handle UPDATE from Telegram when it comes from the allowed user."
@@ -366,7 +429,10 @@ A previous responder that handles it wins."
           (setq agent-shell-pod-telegram-mode nil)
           (user-error "Set `agent-shell-pod-telegram-user-id' first"))
         (setq agent-shell-pod-telegram--token
-              (auth-source-pick-first-password :host "api.telegram.org"))
+              (condition-case err
+                  (auth-source-pick-first-password :host "api.telegram.org")
+                (error (setq agent-shell-pod-telegram-mode nil)
+                       (signal (car err) (cdr err)))))
         (unless agent-shell-pod-telegram--token
           (setq agent-shell-pod-telegram-mode nil)
           (user-error "No password for api.telegram.org in auth-source"))

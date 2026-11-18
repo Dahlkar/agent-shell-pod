@@ -86,6 +86,20 @@
           (should (equal (mapcar #'cdr (agent-shell-pod-telegram-test--texts calls)) sent))
           (should (equal (agent-shell-pod--title (agent-shell-pod-telegram--current)) current)))))))
 
+(ert-deftest agent-shell-pod-telegram-test-list-buttons ()
+  (dolist (case
+           '(;; a button per session that switches to it
+             (t ((inline_keyboard
+                  . [[((text . "1 Alpha") (callback_data . "use:1"))]
+                     [((text . "2 Beta") (callback_data . "use:2"))]])))
+             ;; no buttons without sessions
+             (nil nil)))
+    (pcase-let ((`(,sessions ,markup) case))
+      (agent-shell-pod-telegram-test--with-env
+        (when sessions (agent-shell-pod-telegram-test--sessions tmp))
+        (agent-shell-pod-telegram--list nil)
+        (should (equal (alist-get 'reply_markup (cdar calls)) markup))))))
+
 (ert-deftest agent-shell-pod-telegram-test-new-needs-preferred-config ()
   (agent-shell-pod-telegram-test--with-env
     (agent-shell-pod-telegram-test--sessions tmp)
@@ -104,6 +118,14 @@
                   ("editMessageText" . "[1 Alpha]\nPermission: rm\n\n→ Allow (y)")))
              ;; an unknown or stale key just says it expired
              (42 "9:allow" nil (("answerCallbackQuery" . "Expired")))
+             ;; a session button from /list switches to that session
+             (42 "use:2" nil
+                 (("answerCallbackQuery")
+                  ("sendMessage" . "[2 Beta]\nNow using this session")))
+             ;; a session button for a closed session says so
+             (42 "use:9" nil
+                 (("answerCallbackQuery")
+                  ("sendMessage" . "No session 9.  Send /list")))
              ;; malformed data is treated as expired
              (42 "nonsense" nil (("answerCallbackQuery" . "Expired")))
              ;; a stranger's tap is ignored
@@ -200,7 +222,52 @@
       (let ((texts (mapcar #'cdr (agent-shell-pod-telegram-test--texts calls))))
         (should (equal (mapcar #'length texts) '(4096 20)))
         (should (seq-every-p (lambda (s) (string-prefix-p "[1 Alpha]\n" s)) texts)))
+      (should (seq-every-p (lambda (c) (equal (alist-get 'parse_mode (cdr c)) "HTML")) calls))
       (should (equal agent-shell-pod-telegram--messages (list (cons 502 a) (cons 501 a)))))))
+
+(ert-deftest agent-shell-pod-telegram-test-html ()
+  (dolist (case
+           '(;; plain text is unchanged
+             ("Done" "Done")
+             ;; Telegram's special characters are escaped
+             ("a < b & \"c\"" "a &lt; b &amp; &quot;c&quot;")
+             ;; a fence with a language
+             ("x\n```elisp\n(car l)\n```\ny" "x\n<pre><code class=\"language-elisp\">(car l)</code></pre>y")
+             ;; a fence without a language
+             ("```\nls\n```" "<pre><code>ls</code></pre>")
+             ;; an unclosed fence runs to the end
+             ("```py\nprint(1)" "<pre><code class=\"language-py\">print(1)</code></pre>")
+             ;; fence bodies are escaped and not formatted
+             ("```\na < **b**\n```" "<pre><code>a &lt; **b**</code></pre>")
+             ;; inline code
+             ("run `ls -a` now" "run <code>ls -a</code> now")
+             ;; bold inside inline code stays literal
+             ("`**x** & y`" "<code>**x** &amp; y</code>")
+             ;; bold keeps its case
+             ("a **BIG** deal" "a <b>BIG</b> deal")
+             ;; link
+             ("see [docs](https://x.io/?a=1&b=2)" "see <a href=\"https://x.io/?a=1&amp;b=2\">docs</a>")
+             ;; heading
+             ("## Plan\nstep" "<b>Plan</b>\nstep")
+             ;; unbalanced bold and backtick stay literal
+             ("2 ** 3 and `x" "2 ** 3 and `x")))
+    (should (equal (agent-shell-pod-telegram--html (car case)) (cadr case)))))
+
+(ert-deftest agent-shell-pod-telegram-test-html-fallback ()
+  (agent-shell-pod-telegram-test--with-env
+    (let ((a (car (agent-shell-pod-telegram-test--sessions tmp))))
+      (cl-letf (((symbol-function 'agent-shell-pod-telegram--api)
+                 (lambda (method params &optional callback)
+                   (push (cons method params) calls)
+                   (funcall callback (if (alist-get 'parse_mode params)
+                                         '((ok . :false))
+                                       '((ok . t) (result (message_id . 900))))))))
+        (agent-shell-pod-telegram--say "a **b** <c>" a))
+      (should (equal (mapcar (lambda (c) (list (alist-get 'text (cdr c)) (alist-get 'parse_mode (cdr c))))
+                             (reverse calls))
+                     '(("[1 Alpha]\na <b>b</b> &lt;c&gt;" "HTML")
+                       ("[1 Alpha]\na **b** <c>" nil))))
+      (should (equal agent-shell-pod-telegram--messages (list (cons 900 a)))))))
 
 (ert-deftest agent-shell-pod-telegram-test-mode ()
   (let ((agent-shell-pod-telegram-mode nil)
@@ -216,6 +283,11 @@
         (should-not agent-shell-pod-telegram-mode)
         (should-not polled))
       (let ((agent-shell-pod-telegram-user-id 42))
+        (cl-letf (((symbol-function 'auth-source-pick-first-password)
+                   (lambda (&rest _) (error "Decryption failed"))))
+          (should-error (agent-shell-pod-telegram-mode 1))
+          (should-not agent-shell-pod-telegram-mode)
+          (should-not polled))
         (agent-shell-pod-telegram-mode 1)
         (should (eq agent-shell-permission-responder-function #'agent-shell-pod-telegram--responder))
         (should (memq #'agent-shell-pod-telegram--on-event agent-shell-pod-event-functions))

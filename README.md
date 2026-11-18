@@ -197,7 +197,7 @@ gets cleared.
 |---|---|
 | text | Prompt the current session, or queue it if the agent is busy |
 | reply to a bot message | Prompt that message's session |
-| `/list` | Sessions with number, status, title and project |
+| `/list` | Sessions with number, status, title and project, with a button per session to make it current |
 | `/use N` | Make session N current |
 | `/stop [N]` | Interrupt the session |
 | `/new [N]` | Start an agent in session N's directory. Needs `agent-shell-preferred-agent-config` |
